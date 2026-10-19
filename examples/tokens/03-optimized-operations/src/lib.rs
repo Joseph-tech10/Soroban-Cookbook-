@@ -27,6 +27,8 @@ pub enum StandardDataKey {
     Underlying,
     TotalSupply,
     Balance(Address),
+    /// Reentrancy guard flag for `wrap`.
+    Entered,
 }
 
 #[cfg(any(not(target_arch = "wasm32"), test, feature = "testutils"))]
@@ -38,6 +40,8 @@ pub enum StandardError {
     InvalidAmount = 2,
     InsufficientBalance = 3,
     ArithmeticOverflow = 4,
+    AlreadyInitialized = 5,
+    ReentrancyDetected = 6,
 }
 
 #[cfg(any(not(target_arch = "wasm32"), test, feature = "testutils"))]
@@ -48,6 +52,9 @@ pub struct StandardTokenOps;
 #[contractimpl]
 impl StandardTokenOps {
     pub fn initialize(env: Env, underlying: Address) -> Result<(), StandardError> {
+        if env.storage().instance().has(&StandardDataKey::Underlying) {
+            return Err(StandardError::AlreadyInitialized);
+        }
         env.storage()
             .instance()
             .set(&StandardDataKey::Underlying, &underlying);
@@ -90,16 +97,36 @@ impl StandardTokenOps {
 
         user.require_auth();
 
+        if env
+            .storage()
+            .instance()
+            .get(&StandardDataKey::Entered)
+            .unwrap_or(false)
+        {
+            return Err(StandardError::ReentrancyDetected);
+        }
+        env.storage()
+            .instance()
+            .set(&StandardDataKey::Entered, &true);
+
+        // Checks-effects-interactions: update balances before the external
+        // call, and keep the guard set so a hookable underlying token cannot
+        // reenter `wrap` and mint against the same deposit. Same pattern as
+        // examples/tokens/06-token-wrapper.
+        env.storage()
+            .persistent()
+            .set(&StandardDataKey::Balance(user.clone()), &new_balance);
+        env.storage()
+            .instance()
+            .set(&StandardDataKey::TotalSupply, &new_supply);
+
         let wrapper = env.current_contract_address();
         soroban_sdk::token::TokenClient::new(&env, &underlying_addr)
             .transfer(&user, &wrapper, &amount);
 
         env.storage()
-            .persistent()
-            .set(&StandardDataKey::Balance(user), &new_balance);
-        env.storage()
             .instance()
-            .set(&StandardDataKey::TotalSupply, &new_supply);
+            .set(&StandardDataKey::Entered, &false);
 
         Ok(new_balance)
     }
